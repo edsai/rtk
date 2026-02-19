@@ -20,7 +20,7 @@
 >
 > Branch: `feat/rust-hooks-v2` — 686 tests passing
 
-[Website](https://www.rtk-ai.app) | [GitHub](https://github.com/rtk-ai/rtk) | [Install](INSTALL.md)
+[Upstream Website](https://www.rtk-ai.app) | [Upstream Repo](https://github.com/rtk-ai/rtk) | [This Fork](https://github.com/edsai/rtk)
 
 rtk filters and compresses command outputs before they reach your LLM context, saving 60-90% of tokens on common operations.
 
@@ -87,15 +87,22 @@ If already installed and `rtk gain` works, **DO NOT reinstall**. Skip to Quick S
 brew install rtk
 ```
 
-### Quick Install (Linux/macOS)
+### Install from this fork (recommended)
+
+This fork includes bug fixes not yet merged upstream. Install from source:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+cargo install --git https://github.com/edsai/rtk --branch feat/rust-hooks-v2
 ```
 
 > **Note**: rtk installs to `~/.local/bin` by default. If this directory is not in your PATH, add it:
 > ```bash
 > echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc  # or ~/.zshrc
+> ```
+>
+> **macOS note**: If the binary is killed silently after install (exit code 137), re-sign it:
+> ```bash
+> codesign --sign - --force ~/.local/bin/rtk
 > ```
 
 After installation, **verify you have the correct rtk**:
@@ -103,19 +110,24 @@ After installation, **verify you have the correct rtk**:
 rtk gain  # Must show token savings stats (not "command not found")
 ```
 
-### Alternative: Manual Installation
+### Install from upstream
+
+If you prefer the original author's release (without the fixes listed above):
 
 ```bash
-# From rtk-ai upstream (maintained by pszymkowiak)
-cargo install --git https://github.com/rtk-ai/rtk
+# Homebrew
+brew install rtk
 
-# OR if published to crates.io
-cargo install rtk
+# Quick install script
+curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+
+# Cargo from upstream
+cargo install --git https://github.com/rtk-ai/rtk
 ```
 
 ⚠️ **WARNING**: `cargo install rtk` from crates.io might install the wrong package (Type Kit instead of Token Killer). Always verify with `rtk gain` after installation.
 
-### Alternative: Pre-built Binaries
+### Pre-built Binaries (upstream only)
 
 Download from [rtk-ai/releases](https://github.com/rtk-ai/rtk/releases):
 - macOS: `rtk-x86_64-apple-darwin.tar.gz` / `rtk-aarch64-apple-darwin.tar.gz`
