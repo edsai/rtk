@@ -4,6 +4,22 @@
 
 **High-performance CLI proxy to minimize LLM token consumption.**
 
+> **Fork notice:** This is a maintained fork of [rtk-ai/rtk](https://github.com/rtk-ai/rtk).
+> The upstream repo has many unmerged PRs. This fork cherry-picks bug fixes and adds
+> improvements we depend on. Key changes vs upstream:
+>
+> - **Rust hook engine** — replaces the Python-based Claude Code hook with a Rust lexer/router
+> - **Passthrough fallback** — unknown flags fall back to raw execution instead of hard-exiting ([#200](https://github.com/rtk-ai/rtk/pull/200))
+> - **Git global options** — `-C`, `-c`, `--git-dir`, `--work-tree` passed through correctly ([#192](https://github.com/rtk-ai/rtk/pull/192))
+> - **Git commit multi `-m`** — `git commit -m "title" -m "body"` support ([#203](https://github.com/rtk-ai/rtk/pull/203))
+> - **gh output format flags** — `--json`/`--jq`/`--template` passthrough ([#196](https://github.com/rtk-ai/rtk/pull/196))
+> - **gh body filter** — strips markdown noise from `gh issue/pr view` ([#214](https://github.com/rtk-ai/rtk/pull/214))
+> - **grep `-r`/`-n`/`-i` compat** — accepts common grep flags without Clap rejection ([#135](https://github.com/rtk-ai/rtk/pull/135))
+> - **find native flags** — `-name`, `-type`, etc. pass through to find ([#211](https://github.com/rtk-ai/rtk/pull/211))
+> - **AWS CLI + psql modules** — token-optimized output for `aws` and `psql` ([#216](https://github.com/rtk-ai/rtk/pull/216))
+>
+> Branch: `feat/rust-hooks-v2` — 686 tests passing
+
 [Website](https://www.rtk-ai.app) | [GitHub](https://github.com/rtk-ai/rtk) | [Install](INSTALL.md)
 
 rtk filters and compresses command outputs before they reach your LLM context, saving 60-90% of tokens on common operations.
