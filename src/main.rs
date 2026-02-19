@@ -279,7 +279,13 @@ enum Commands {
         /// Show line numbers (always on, accepted for grep/rg compatibility)
         #[arg(short = 'n', long)]
         line_numbers: bool,
-        /// Extra ripgrep arguments (e.g., -i, -A 3, -w, --glob)
+        /// Recursive search (always on in rg, accepted for grep compatibility)
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        /// Case-insensitive search (passed through to rg)
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+        /// Extra ripgrep arguments (e.g., -A 3, -w, --glob)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -1283,8 +1289,17 @@ fn main() -> Result<()> {
             context_only,
             file_type,
             line_numbers: _, // no-op: line numbers always enabled in grep_cmd::run
+            recursive: _,    // no-op: rg is recursive by default
+            ignore_case,
             extra_args,
         } => {
+            // Prepend -i to extra_args if ignore_case flag was set
+            let mut all_args = if ignore_case {
+                vec!["-i".to_string()]
+            } else {
+                vec![]
+            };
+            all_args.extend(extra_args);
             grep_cmd::run(
                 &pattern,
                 &path,
@@ -1292,7 +1307,7 @@ fn main() -> Result<()> {
                 max,
                 context_only,
                 file_type.as_deref(),
-                &extra_args,
+                &all_args,
                 cli.verbose,
             )?;
         }
@@ -1710,6 +1725,7 @@ mod tests {
         match cli.command {
             Commands::Git {
                 command: GitCommands::Commit { message },
+                ..
             } => {
                 assert_eq!(message, vec!["fix: typo"]);
             }
@@ -1732,6 +1748,7 @@ mod tests {
         match cli.command {
             Commands::Git {
                 command: GitCommands::Commit { message },
+                ..
             } => {
                 assert_eq!(message, vec!["feat: add support", "Body paragraph here."]);
             }
@@ -1756,6 +1773,7 @@ mod tests {
         match cli.command {
             Commands::Git {
                 command: GitCommands::Commit { message },
+                ..
             } => {
                 assert_eq!(message, vec!["title", "body", "footer"]);
             }
@@ -1797,15 +1815,10 @@ mod tests {
     }
 
     #[test]
-    fn test_try_parse_git_with_dash_c_fails() {
-        // This is the case that triggers fallback: git -C /path status
-        match Cli::try_parse_from(["rtk", "git", "-C", "/path", "status"]) {
-            Err(e) => assert!(!matches!(
-                e.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            )),
-            Ok(_) => panic!("Expected parse error for git -C"),
-        }
+    fn test_try_parse_git_with_dash_c_succeeds() {
+        // git -C /path status should parse successfully now that -C is a recognized option
+        let result = Cli::try_parse_from(["rtk", "git", "-C", "/path", "status"]);
+        assert!(result.is_ok(), "git -C should parse successfully");
     }
 
     #[test]

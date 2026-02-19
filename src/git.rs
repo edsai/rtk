@@ -1642,7 +1642,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
     fn test_branch_creation_not_swallowed() {
         let branch = "test-rtk-create-branch-regression";
         // Create branch via run_branch
-        run_branch(&[branch.to_string()], 0).expect("run_branch should succeed");
+        run_branch(&[branch.to_string()], 0, &[]).expect("run_branch should succeed");
         // Verify it exists
         let output = Command::new("git")
             .args(["branch", "--list", branch])
@@ -1663,7 +1663,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
     #[ignore] // Integration test: requires git repo
     fn test_branch_creation_from_commit() {
         let branch = "test-rtk-create-from-commit";
-        run_branch(&[branch.to_string(), "HEAD".to_string()], 0)
+        run_branch(&[branch.to_string(), "HEAD".to_string()], 0, &[])
             .expect("run_branch with start-point should succeed");
         let output = Command::new("git")
             .args(["branch", "--list", branch])
@@ -1681,7 +1681,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
     #[test]
     fn test_commit_single_message() {
         let messages = vec!["fix: typo".to_string()];
-        let cmd = build_commit_command(&messages);
+        let cmd = build_commit_command(&messages, &[]);
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -1695,7 +1695,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
             "feat: add multi-paragraph support".to_string(),
             "This allows git commit -m \"title\" -m \"body\".".to_string(),
         ];
-        let cmd = build_commit_command(&messages);
+        let cmd = build_commit_command(&messages, &[]);
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -1719,7 +1719,7 @@ no changes added to commit (use "git add" and/or "git commit -a")
             "body".to_string(),
             "footer: refs #202".to_string(),
         ];
-        let cmd = build_commit_command(&messages);
+        let cmd = build_commit_command(&messages, &[]);
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
