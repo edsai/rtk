@@ -53,12 +53,16 @@ pub fn run(
         print_kpi("Total commands", summary.total_commands.to_string());
         print_kpi("Input tokens", format_tokens(summary.total_input));
         print_kpi("Output tokens", format_tokens(summary.total_output));
+        print_kpi("Tokens saved", format_tokens(summary.total_saved));
         print_kpi(
-            "Tokens saved",
+            "Savings (total)",
+            format!("{:.1}%", summary.avg_savings_pct),
+        );
+        print_kpi(
+            "Savings (filtered)",
             format!(
-                "{} ({:.1}%)",
-                format_tokens(summary.total_saved),
-                summary.avg_savings_pct
+                "{:.1}% ({} of {} cmds)",
+                summary.normalized_savings_pct, summary.normalized_commands, summary.total_commands
             ),
         );
         print_kpi(
@@ -69,7 +73,7 @@ pub fn run(
                 format_duration(summary.avg_time_ms)
             ),
         );
-        print_efficiency_meter(summary.avg_savings_pct); // added: visual meter
+        print_efficiency_meter(summary.normalized_savings_pct);
         println!();
 
         if !summary.by_command.is_empty() {
@@ -402,6 +406,8 @@ struct ExportSummary {
     total_output: usize,
     total_saved: usize,
     avg_savings_pct: f64,
+    normalized_savings_pct: f64,
+    normalized_commands: usize,
     total_time_ms: u64,
     avg_time_ms: u64,
 }
@@ -424,6 +430,8 @@ fn export_json(
             total_output: summary.total_output,
             total_saved: summary.total_saved,
             avg_savings_pct: summary.avg_savings_pct,
+            normalized_savings_pct: summary.normalized_savings_pct,
+            normalized_commands: summary.normalized_commands,
             total_time_ms: summary.total_time_ms,
             avg_time_ms: summary.avg_time_ms,
         },

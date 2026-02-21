@@ -1514,10 +1514,7 @@ ___
 
     #[test]
     fn test_has_output_format_flags_jq() {
-        assert!(has_output_format_flags(&[
-            "--jq".into(),
-            ".title".into()
-        ]));
+        assert!(has_output_format_flags(&["--jq".into(), ".title".into()]));
         assert!(has_output_format_flags(&["-q".into(), ".title".into()]));
     }
 
@@ -1527,10 +1524,7 @@ ___
             "--template".into(),
             "{{.title}}".into()
         ]));
-        assert!(has_output_format_flags(&[
-            "-t".into(),
-            "{{.title}}".into()
-        ]));
+        assert!(has_output_format_flags(&["-t".into(), "{{.title}}".into()]));
     }
 
     #[test]
