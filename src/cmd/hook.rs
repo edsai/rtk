@@ -69,24 +69,26 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
     // PR 2 adds: crate::config::rules::try_remap() alias expansion
     // PR 2 adds: safety::check_raw() and safety::check() dispatch
 
-    // Try suffix extraction: strip 2>&1 / pipes before routing so the
-    // core command can be routed to an optimized subcommand.
-    if let Some((core, suffix)) = extract_shell_suffix(raw) {
-        let core_tokens = lexer::tokenize(core);
-        if !analysis::needs_shell(&core_tokens) {
-            if let Ok(commands) = analysis::parse_chain(core_tokens) {
-                if commands.len() == 1 {
-                    let routed = route_native_command(&commands[0], core);
-                    // Re-attach suffix only if we got an optimized route
-                    if !routed.contains("rtk run -c") {
-                        return HookResult::Rewrite(format!("{} {}", routed, suffix));
-                    }
-                }
-            }
+    // 1. Chain-aware routing: split at &&, ||, ; and route each segment.
+    //    Handles: `cd /path && git status 2>&1` → `cd /path && rtk git status 2>&1`
+    if let Some(segments) = split_chain_raw(raw) {
+        if let Some(routed) = route_chain(&segments) {
+            return HookResult::Rewrite(routed);
         }
-        // Fall through: core has shellisms or didn't route — wrap full command
+        // No segment was optimized — wrap entire chain in passthrough
+        return HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw)));
     }
 
+    // 2. Single command with suffix: strip 2>&1 / pipes before routing.
+    if let Some((core, suffix)) = extract_shell_suffix(raw) {
+        let routed = route_segment_inner(core);
+        if routed != core {
+            return HookResult::Rewrite(format!("{} {}", routed, suffix));
+        }
+        // Fall through: core has shellisms or didn't route
+    }
+
+    // 3. Standard single-command routing.
     let tokens = lexer::tokenize(raw);
 
     if analysis::needs_shell(&tokens) {
@@ -94,16 +96,142 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
     }
 
     match analysis::parse_chain(tokens) {
-        Ok(commands) => {
-            // Single command: route to optimized RTK subcommand.
-            // Chained commands (&&, ||, ;): wrap entire chain in rtk run -c.
-            if commands.len() == 1 {
-                HookResult::Rewrite(route_native_command(&commands[0], raw))
+        Ok(commands) if commands.len() == 1 => {
+            HookResult::Rewrite(route_native_command(&commands[0], raw))
+        }
+        _ => HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw))),
+    }
+}
+
+/// Route a single command segment (no chain operators). Returns the original
+/// string unchanged if the command can't be optimized.
+fn route_segment_inner(segment: &str) -> String {
+    let tokens = lexer::tokenize(segment);
+    if analysis::needs_shell(&tokens) {
+        return segment.to_string();
+    }
+    match analysis::parse_chain(tokens) {
+        Ok(commands) if commands.len() == 1 => {
+            let routed = route_native_command(&commands[0], segment);
+            if routed.contains("rtk run -c") {
+                segment.to_string()
             } else {
-                HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw)))
+                routed
             }
         }
-        Err(_) => HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw))),
+        _ => segment.to_string(),
+    }
+}
+
+/// Route each segment of a chain individually, handling suffixes per-segment.
+/// Returns Some(reconstructed_chain) if at least one segment was optimized.
+fn route_chain(segments: &[(&str, &str)]) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut any_optimized = false;
+
+    for (segment, operator) in segments {
+        // Try suffix extraction on this segment, then route the core
+        let routed = match extract_shell_suffix(segment) {
+            Some((core, suffix)) => {
+                let routed_core = route_segment_inner(core);
+                if routed_core != core {
+                    format!("{} {}", routed_core, suffix)
+                } else {
+                    segment.to_string()
+                }
+            }
+            None => route_segment_inner(segment),
+        };
+
+        if routed != *segment {
+            any_optimized = true;
+        }
+        parts.push(routed);
+        if !operator.is_empty() {
+            parts.push(operator.to_string());
+        }
+    }
+
+    if any_optimized {
+        Some(parts.join(" "))
+    } else {
+        None
+    }
+}
+
+/// Split a command string at unquoted chain operators (&&, ||, ;).
+/// Returns None if no operators found (single command).
+fn split_chain_raw(raw: &str) -> Option<Vec<(&str, &str)>> {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut segments = Vec::new();
+    let mut seg_start = 0;
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+
+    while i < len {
+        let b = bytes[i];
+
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+
+        // && (2 bytes)
+        if b == b'&' && i + 1 < len && bytes[i + 1] == b'&' {
+            segments.push((raw[seg_start..i].trim(), "&&"));
+            i += 2;
+            seg_start = i;
+            continue;
+        }
+
+        // || (2 bytes)
+        if b == b'|' && i + 1 < len && bytes[i + 1] == b'|' {
+            segments.push((raw[seg_start..i].trim(), "||"));
+            i += 2;
+            seg_start = i;
+            continue;
+        }
+
+        // ; (1 byte)
+        if b == b';' {
+            segments.push((raw[seg_start..i].trim(), ";"));
+            i += 1;
+            seg_start = i;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    let last = raw[seg_start..].trim();
+    if !last.is_empty() {
+        segments.push((last, ""));
+    }
+
+    if segments.len() <= 1 {
+        None
+    } else {
+        Some(segments)
     }
 }
 
@@ -463,7 +591,7 @@ mod tests {
             ("echo {a,b}.txt", "rtk run"),    // brace expansion
             ("echo 'hello!@#$%^&*()'", "rtk run"), // special chars
             ("echo '日本語 🎉'", "rtk run"),  // unicode
-            ("cd /tmp && git status", "rtk run"), // chain rewrite
+            ("cd /tmp && git status", "rtk git status"), // chain: cd kept, git routed
         ];
         for (input, expected) in cases {
             assert_rewrite(input, expected);
@@ -616,26 +744,26 @@ mod tests {
     #[test]
     fn test_compound_commands_rewrite() {
         let cases = [
-            // Basic chains — each command rewritten independently
-            ("cd /tmp && git status", "&&"),
-            ("cd dir && git status && git diff", "&&"),
-            ("git add . && git commit -m msg", "&&"),
-            // Semicolon chains
-            ("echo start ; git status ; echo done", ";"),
-            // Or-chains
-            ("git pull || echo failed", "||"),
+            // Chain routing: each segment routed individually
+            ("cd /tmp && git status", "cd /tmp && rtk git status"),
+            (
+                "cd dir && git status && git diff",
+                "cd dir && rtk git status && rtk git diff",
+            ),
+            (
+                "git add . && git commit -m msg",
+                "rtk git add . && rtk git commit -m msg",
+            ),
+            // Semicolon: routable segments get optimized
+            (
+                "echo start ; git status ; echo done",
+                "echo start ; rtk git status ; echo done",
+            ),
+            // Or-chain: pull is routable, echo is not
+            ("git pull || echo failed", "rtk git pull || echo failed"),
         ];
-        for (input, operator) in cases {
-            match check_for_hook(input, "claude") {
-                HookResult::Rewrite(cmd) => {
-                    assert!(cmd.contains("rtk run"), "'{input}' should rewrite");
-                    assert!(
-                        cmd.contains(operator),
-                        "'{input}' must preserve '{operator}', got '{cmd}'"
-                    );
-                }
-                other => panic!("Expected Rewrite for '{input}', got {other:?}"),
-            }
+        for (input, expected) in cases {
+            assert_rewrite(input, expected);
         }
     }
 
@@ -775,6 +903,90 @@ mod tests {
     fn test_suffix_routing_unroutable_core_falls_through() {
         // tail is not routable — suffix extraction finds pipe but core falls back to rtk run -c
         assert_rewrite("tail -f server.log | grep error", "rtk run");
+    }
+
+    // === CHAIN-AWARE ROUTING ===
+    // Chains (cd && cmd, cmd1 && cmd2) route each segment individually.
+
+    #[test]
+    fn test_chain_cd_then_git_with_suffix() {
+        assert_rewrite(
+            "cd /Users/dev/project && git status 2>&1",
+            "cd /Users/dev/project && rtk git status 2>&1",
+        );
+    }
+
+    #[test]
+    fn test_chain_cd_then_npx_tsc_with_suffix() {
+        assert_rewrite(
+            "cd /path/to/project && npx tsc --noEmit 2>&1",
+            "cd /path/to/project && rtk tsc --noEmit 2>&1",
+        );
+    }
+
+    #[test]
+    fn test_chain_cd_then_cargo_test_pipe() {
+        assert_rewrite(
+            "cd /path && cargo test 2>&1 | tail -20",
+            "cd /path && rtk cargo test 2>&1 | tail -20",
+        );
+    }
+
+    #[test]
+    fn test_chain_both_segments_routable() {
+        assert_rewrite("git add . && git status", "rtk git add . && rtk git status");
+    }
+
+    #[test]
+    fn test_chain_triple_mixed() {
+        assert_rewrite(
+            "cd /tmp && git status && git diff HEAD",
+            "cd /tmp && rtk git status && rtk git diff HEAD",
+        );
+    }
+
+    #[test]
+    fn test_chain_semicolon_partial_route() {
+        assert_rewrite(
+            "echo start ; cargo test ; echo done",
+            "echo start ; rtk cargo test ; echo done",
+        );
+    }
+
+    #[test]
+    fn test_chain_no_routable_segments() {
+        // Neither segment routable → falls through to rtk run -c
+        assert_rewrite("sleep 5 && echo done", "rtk run -c");
+    }
+
+    #[test]
+    fn test_chain_quoted_operator_not_split() {
+        // && inside quotes must NOT split — routes as single command
+        assert_rewrite("git commit -m \"Fix && Bug\"", "rtk git commit");
+    }
+
+    #[test]
+    fn test_chain_shellism_in_segment_kept() {
+        // ls *.rs has shellism — segment kept as-is, cd not routable
+        assert_rewrite("cd /tmp && ls *.rs", "rtk run -c");
+    }
+
+    #[test]
+    fn test_split_chain_raw_basic() {
+        let segs = split_chain_raw("cd /tmp && git status").unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], ("cd /tmp", "&&"));
+        assert_eq!(segs[1], ("git status", ""));
+    }
+
+    #[test]
+    fn test_split_chain_raw_none_for_single() {
+        assert!(split_chain_raw("git status").is_none());
+    }
+
+    #[test]
+    fn test_split_chain_raw_quoted_not_split() {
+        assert!(split_chain_raw("git commit -m \"Fix && Bug\"").is_none());
     }
 
     // === MULTI-AGENT ===
@@ -1048,12 +1260,11 @@ mod tests {
 
     #[test]
     fn test_routing_fallbacks_to_rtk_run() {
-        // Unknown subcommand, chains (2+ cmds), and unroutable pipes fall back to rtk run -c.
+        // Unknown subcommand and unroutable commands fall back to rtk run -c.
         let cases = [
-            "git checkout main",              // unknown git subcommand
-            "git add . && git commit -m msg", // chain → 2 commands → rtk run -c
-            "tail -n 20 file.txt",            // no rtk tail subcommand
-            "tail -f server.log",             // no rtk tail subcommand
+            "git checkout main", // unknown git subcommand
+            "tail -n 20 file.txt", // no rtk tail subcommand
+            "tail -f server.log", // no rtk tail subcommand
         ];
         for input in cases {
             assert_rewrite(input, "rtk run -c");
