@@ -55,17 +55,6 @@ pub fn run(
         print_kpi("Output tokens", format_tokens(summary.total_output));
         print_kpi("Tokens saved", format_tokens(summary.total_saved));
         print_kpi(
-            "Savings (total)",
-            format!("{:.1}%", summary.avg_savings_pct),
-        );
-        print_kpi(
-            "Savings (filtered)",
-            format!(
-                "{:.1}% ({} of {} cmds)",
-                summary.normalized_savings_pct, summary.normalized_commands, summary.total_commands
-            ),
-        );
-        print_kpi(
             "Total exec time",
             format!(
                 "{} (avg {})",
@@ -73,7 +62,15 @@ pub fn run(
                 format_duration(summary.avg_time_ms)
             ),
         );
-        print_efficiency_meter(summary.normalized_savings_pct);
+        print_labeled_meter("Savings (total)", summary.avg_savings_pct, None);
+        print_labeled_meter(
+            "Savings (filtered)",
+            summary.normalized_savings_pct,
+            Some(format!(
+                "{} of {} cmds",
+                summary.normalized_commands, summary.total_commands
+            )),
+        );
         println!();
 
         if !summary.by_command.is_empty() {
@@ -260,9 +257,9 @@ fn styled(text: &str, strong: bool) -> String {
     }
 }
 
-/// Print a key-value pair in KPI layout. // added
+/// Print a key-value pair in KPI layout.
 fn print_kpi(label: &str, value: String) {
-    println!("{:<18} {}", format!("{label}:"), value);
+    println!("{:<20} {}", format!("{label}:"), value);
 }
 
 /// Colorize percentage based on savings tier (TTY-aware). // added
@@ -320,11 +317,14 @@ fn mini_bar(value: usize, max: usize, width: usize) -> String {
     }
 }
 
-/// Print an efficiency meter with colored progress bar (TTY-aware). // added
-fn print_efficiency_meter(pct: f64) {
-    let width = 24usize;
-    let filled = (((pct / 100.0) * width as f64).round() as usize).min(width);
-    let meter = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled));
+/// Print a labeled efficiency meter with colored progress bar (TTY-aware).
+/// Print a labeled efficiency meter with colored progress bar (TTY-aware).
+fn print_labeled_meter(label: &str, pct: f64, suffix: Option<String>) {
+    let label_width = 20usize;
+    let bar_width = 24usize;
+    let filled = (((pct / 100.0) * bar_width as f64).round() as usize).min(bar_width);
+    let meter = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+    let suffix_str = suffix.map(|s| format!(" ({s})")).unwrap_or_default();
     if std::io::stdout().is_terminal() {
         let pct_str = format!("{pct:.1}%");
         let colored_pct = if pct >= 70.0 {
@@ -334,9 +334,21 @@ fn print_efficiency_meter(pct: f64) {
         } else {
             pct_str.red().bold().to_string()
         };
-        println!("Efficiency meter: {} {}", meter.green(), colored_pct);
+        println!(
+            "{:<label_width$} {} {}{}",
+            format!("{label}:"),
+            meter.green(),
+            colored_pct,
+            suffix_str,
+        );
     } else {
-        println!("Efficiency meter: {} {:.1}%", meter, pct);
+        println!(
+            "{:<label_width$} {} {:.1}%{}",
+            format!("{label}:"),
+            meter,
+            pct,
+            suffix_str,
+        );
     }
 }
 
