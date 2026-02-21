@@ -69,6 +69,24 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
     // PR 2 adds: crate::config::rules::try_remap() alias expansion
     // PR 2 adds: safety::check_raw() and safety::check() dispatch
 
+    // Try suffix extraction: strip 2>&1 / pipes before routing so the
+    // core command can be routed to an optimized subcommand.
+    if let Some((core, suffix)) = extract_shell_suffix(raw) {
+        let core_tokens = lexer::tokenize(core);
+        if !analysis::needs_shell(&core_tokens) {
+            if let Ok(commands) = analysis::parse_chain(core_tokens) {
+                if commands.len() == 1 {
+                    let routed = route_native_command(&commands[0], core);
+                    // Re-attach suffix only if we got an optimized route
+                    if !routed.contains("rtk run -c") {
+                        return HookResult::Rewrite(format!("{} {}", routed, suffix));
+                    }
+                }
+            }
+        }
+        // Fall through: core has shellisms or didn't route — wrap full command
+    }
+
     let tokens = lexer::tokenize(raw);
 
     if analysis::needs_shell(&tokens) {
@@ -147,6 +165,80 @@ pub enum HookResponse {
     /// Deny — exit 2, JSON to stdout + reason to stderr.
     /// Fields: (stdout_json, stderr_reason)
     Deny(String, String),
+}
+
+/// Extract trailing shell suffix (`2>&1`, pipes) from a command string.
+///
+/// Does a quote-aware scan to find the earliest unquoted:
+/// - `2>&1` (stderr redirect)
+/// - `|` (pipe — but NOT `||` which is an operator)
+///
+/// Returns `Some((core, suffix))` if found, `None` otherwise.
+fn extract_shell_suffix(raw: &str) -> Option<(&str, &str)> {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+
+    while i < len {
+        let b = bytes[i];
+
+        // Handle escapes (not inside single quotes)
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        // Handle quotes
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+
+        // Outside quotes: check for 2>&1 (4 bytes)
+        if b == b'2'
+            && i + 3 < len
+            && bytes[i + 1] == b'>'
+            && bytes[i + 2] == b'&'
+            && bytes[i + 3] == b'1'
+        {
+            let core = raw[..i].trim_end();
+            if !core.is_empty() {
+                return Some((core, &raw[i..]));
+            }
+        }
+
+        // Check for | (pipe) but NOT || (operator)
+        if b == b'|' {
+            if i + 1 < len && bytes[i + 1] == b'|' {
+                i += 2; // skip ||
+                continue;
+            }
+            let core = raw[..i].trim_end();
+            if !core.is_empty() {
+                return Some((core, &raw[i..]));
+            }
+        }
+
+        i += 1;
+    }
+
+    None
 }
 
 /// Escape single quotes for shell
@@ -572,16 +664,117 @@ mod tests {
 
     #[test]
     fn test_token_waste_allowed_in_pipelines() {
+        // Commands with pipes/redirects that can't be suffix-stripped still pass through.
         let cases = [
-            "cat file.txt | grep pattern",
-            "cat file.txt > output.txt",
-            "sed 's/old/new/' file.txt > output.txt",
-            "head -n 10 file.txt | grep pattern",
-            "for f in *.txt; do cat \"$f\" | grep x; done",
+            ("cat file.txt > output.txt", "rtk run"), // plain > redirect
+            ("sed 's/old/new/' file.txt > output.txt", "rtk run"), // sed with redirect
+            ("head -n 10 file.txt | grep pattern", "rtk run"), // head not routable
+            ("for f in *.txt; do cat \"$f\" | grep x; done", "rtk run"), // shellisms in core
         ];
-        for input in cases {
-            assert_rewrite(input, "rtk run");
+        for (input, expected) in cases {
+            assert_rewrite(input, expected);
         }
+    }
+
+    // === SHELL SUFFIX STRIPPING (2>&1, pipes) ===
+    // Commands with trailing 2>&1 or pipes should still route to optimized subcommands.
+
+    #[test]
+    fn test_extract_shell_suffix_2_redirect() {
+        assert_eq!(
+            extract_shell_suffix("git status 2>&1"),
+            Some(("git status", "2>&1"))
+        );
+    }
+
+    #[test]
+    fn test_extract_shell_suffix_pipe() {
+        assert_eq!(
+            extract_shell_suffix("git log | head -5"),
+            Some(("git log", "| head -5"))
+        );
+    }
+
+    #[test]
+    fn test_extract_shell_suffix_combined() {
+        assert_eq!(
+            extract_shell_suffix("cargo test 2>&1 | tail -20"),
+            Some(("cargo test", "2>&1 | tail -20"))
+        );
+    }
+
+    #[test]
+    fn test_extract_shell_suffix_none() {
+        assert_eq!(extract_shell_suffix("git status"), None);
+    }
+
+    #[test]
+    fn test_extract_shell_suffix_quoted_pipe() {
+        assert_eq!(extract_shell_suffix("echo 'hello | world'"), None);
+    }
+
+    #[test]
+    fn test_extract_shell_suffix_double_pipe_not_split() {
+        // || is an operator, not a pipe — should not trigger suffix extraction
+        assert_eq!(extract_shell_suffix("git pull || echo failed"), None);
+    }
+
+    #[test]
+    fn test_suffix_routing_git_status_2_redirect() {
+        assert_rewrite("git status 2>&1", "rtk git status 2>&1");
+    }
+
+    #[test]
+    fn test_suffix_routing_cargo_test_2_redirect() {
+        assert_rewrite("cargo test 2>&1", "rtk cargo test 2>&1");
+    }
+
+    #[test]
+    fn test_suffix_routing_git_log_pipe() {
+        assert_rewrite("git log -10 | head -5", "rtk git log -10 | head -5");
+    }
+
+    #[test]
+    fn test_suffix_routing_grep_pipe() {
+        assert_rewrite(
+            "grep -rn pattern src/ | head -20",
+            "rtk grep -rn pattern src/ | head -20",
+        );
+    }
+
+    #[test]
+    fn test_suffix_routing_cargo_test_combined() {
+        assert_rewrite(
+            "cargo test 2>&1 | tail -20",
+            "rtk cargo test 2>&1 | tail -20",
+        );
+    }
+
+    #[test]
+    fn test_suffix_routing_cat_pipe_optimized() {
+        // cat routes to rtk read, so cat with pipe should also optimize
+        assert_rewrite(
+            "cat file.txt | grep pattern",
+            "rtk read file.txt | grep pattern",
+        );
+    }
+
+    #[test]
+    fn test_suffix_routing_quoted_pipe_unchanged() {
+        // Quoted pipe: no suffix extraction, routes normally as single command
+        assert_rewrite("git commit -m \"fix | bug\"", "rtk git commit");
+    }
+
+    #[test]
+    fn test_suffix_routing_shellism_core_falls_through() {
+        // Core has shellisms (echo $VAR) — can't optimize, falls through to rtk run -c
+        assert_rewrite("echo $VAR 2>&1", "rtk run -c");
+    }
+
+    #[test]
+    fn test_suffix_routing_unroutable_core_falls_through() {
+        // tail is not routable — suffix extraction finds pipe but core falls back to rtk run -c
+        assert_rewrite("tail -f server.log | grep error", "rtk run");
     }
 
     // === MULTI-AGENT ===
@@ -855,11 +1048,10 @@ mod tests {
 
     #[test]
     fn test_routing_fallbacks_to_rtk_run() {
-        // Unknown subcommand, chains (2+ cmds), and pipes fall back to rtk run -c.
+        // Unknown subcommand, chains (2+ cmds), and unroutable pipes fall back to rtk run -c.
         let cases = [
             "git checkout main",              // unknown git subcommand
             "git add . && git commit -m msg", // chain → 2 commands → rtk run -c
-            "git log | grep fix",             // pipe → needs_shell → rtk run -c
             "tail -n 20 file.txt",            // no rtk tail subcommand
             "tail -f server.log",             // no rtk tail subcommand
         ];
