@@ -1,6 +1,6 @@
 [package]
 name = "rtk"
-version = "0.22.0"
+version = "0.22.1"
 edition = "2021"
 authors = ["Patrick Szymkowiak"]
 description = "Rust Token Killer - High-performance CLI proxy to minimize LLM token consumption"
@@ -26,6 +26,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 toml = "0.8"
 chrono = "0.4"
 thiserror = "1.0"
+which = "7"
 tempfile = "3"
 
 [dev-dependencies]

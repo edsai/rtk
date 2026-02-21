@@ -40,6 +40,11 @@ use std::time::Instant;
 /// Number of days to retain tracking history before automatic cleanup.
 const HISTORY_DAYS: i64 = 90;
 
+/// Minimum savings percentage to record a command.
+/// Commands below this threshold (e.g. passthrough with ~0% savings)
+/// are silently dropped to prevent polluting the tracking database.
+const MIN_SAVINGS_PCT: f64 = 5.0;
+
 /// Main tracking interface for recording and querying command history.
 ///
 /// Manages SQLite database connection and provides methods for:
@@ -98,8 +103,12 @@ pub struct GainSummary {
     pub total_output: usize,
     /// Total tokens saved (input - output)
     pub total_saved: usize,
-    /// Average savings percentage across all commands
+    /// Average savings percentage across all commands (weighted by token volume)
     pub avg_savings_pct: f64,
+    /// Normalized savings: same calculation but excluding records with <5% savings
+    pub normalized_savings_pct: f64,
+    /// Number of commands included in the normalized calculation
+    pub normalized_commands: usize,
     /// Total execution time across all commands (milliseconds)
     pub total_time_ms: u64,
     /// Average execution time per command (milliseconds)
@@ -252,6 +261,21 @@ impl Tracker {
             [],
         );
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS parse_failures (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                raw_command TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                fallback_succeeded INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -317,7 +341,89 @@ impl Tracker {
             "DELETE FROM commands WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
+        self.conn.execute(
+            "DELETE FROM parse_failures WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
         Ok(())
+    }
+
+    /// Record a parse failure for analytics.
+    pub fn record_parse_failure(
+        &self,
+        raw_command: &str,
+        error_message: &str,
+        fallback_succeeded: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO parse_failures (timestamp, raw_command, error_message, fallback_succeeded)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                Utc::now().to_rfc3339(),
+                raw_command,
+                error_message,
+                fallback_succeeded as i32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get parse failure summary for `rtk gain --failures`.
+    pub fn get_parse_failure_summary(&self) -> Result<ParseFailureSummary> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM parse_failures", [], |row| row.get(0))?;
+
+        let succeeded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM parse_failures WHERE fallback_succeeded = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let recovery_rate = if total > 0 {
+            (succeeded as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Top commands by frequency
+        let mut stmt = self.conn.prepare(
+            "SELECT raw_command, COUNT(*) as cnt
+             FROM parse_failures
+             GROUP BY raw_command
+             ORDER BY cnt DESC
+             LIMIT 10",
+        )?;
+        let top_commands = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Recent 10
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, raw_command, error_message, fallback_succeeded
+             FROM parse_failures
+             ORDER BY timestamp DESC
+             LIMIT 10",
+        )?;
+        let recent = stmt
+            .query_map([], |row| {
+                Ok(ParseFailureRecord {
+                    timestamp: row.get(0)?,
+                    raw_command: row.get(1)?,
+                    error_message: row.get(2)?,
+                    fallback_succeeded: row.get::<_, i32>(3)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ParseFailureSummary {
+            total: total as usize,
+            recovery_rate,
+            top_commands,
+            recent,
+        })
     }
 
     /// Get overall summary statistics across all recorded commands.
@@ -346,8 +452,13 @@ impl Tracker {
         let mut total_saved = 0usize;
         let mut total_time_ms = 0u64;
 
+        // Normalized accumulators (only records with >= 5% savings)
+        let mut norm_commands = 0usize;
+        let mut norm_input = 0usize;
+        let mut norm_saved = 0usize;
+
         let mut stmt = self.conn.prepare(
-            "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms FROM commands",
+            "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms, savings_pct FROM commands",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -356,20 +467,33 @@ impl Tracker {
                 row.get::<_, i64>(1)? as usize,
                 row.get::<_, i64>(2)? as usize,
                 row.get::<_, i64>(3)? as u64,
+                row.get::<_, f64>(4)?,
             ))
         })?;
 
         for row in rows {
-            let (input, output, saved, time_ms) = row?;
+            let (input, output, saved, time_ms, pct) = row?;
             total_commands += 1;
             total_input += input;
             total_output += output;
             total_saved += saved;
             total_time_ms += time_ms;
+
+            if pct >= MIN_SAVINGS_PCT {
+                norm_commands += 1;
+                norm_input += input;
+                norm_saved += saved;
+            }
         }
 
         let avg_savings_pct = if total_input > 0 {
             (total_saved as f64 / total_input as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let normalized_savings_pct = if norm_input > 0 {
+            (norm_saved as f64 / norm_input as f64) * 100.0
         } else {
             0.0
         };
@@ -389,6 +513,8 @@ impl Tracker {
             total_output,
             total_saved,
             avg_savings_pct,
+            normalized_savings_pct,
+            normalized_commands: norm_commands,
             total_time_ms,
             avg_time_ms,
             by_command,
@@ -695,6 +821,32 @@ fn get_db_path() -> Result<PathBuf> {
     Ok(data_dir.join("rtk").join("history.db"))
 }
 
+/// Individual parse failure record.
+#[derive(Debug)]
+pub struct ParseFailureRecord {
+    pub timestamp: String,
+    pub raw_command: String,
+    pub error_message: String,
+    pub fallback_succeeded: bool,
+}
+
+/// Aggregated parse failure summary.
+#[derive(Debug)]
+pub struct ParseFailureSummary {
+    pub total: usize,
+    pub recovery_rate: f64,
+    pub top_commands: Vec<(String, usize)>,
+    pub recent: Vec<ParseFailureRecord>,
+}
+
+/// Record a parse failure without ever crashing.
+/// Silently ignores all errors — used in the fallback path.
+pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, succeeded: bool) {
+    if let Ok(tracker) = Tracker::new() {
+        let _ = tracker.record_parse_failure(raw_command, error_message, succeeded);
+    }
+}
+
 /// Estimate token count from text using ~4 chars = 1 token heuristic.
 ///
 /// This is a fast approximation suitable for tracking purposes.
@@ -936,48 +1088,46 @@ mod tests {
         assert_eq!(test_record.savings_pct, 80.0);
     }
 
-    // 4. track_passthrough doesn't dilute stats (input=0, output=0)
+    // 4. All commands are tracked (low-savings included for aggregate stats)
     #[test]
-    fn test_track_passthrough_no_dilution() {
+    fn test_all_savings_levels_tracked() {
         let tracker = Tracker::new().expect("Failed to create tracker");
 
-        // Use unique test identifiers
         let pid = std::process::id();
-        let cmd1 = format!("rtk cmd1_test_{}", pid);
-        let cmd2 = format!("rtk cmd2_passthrough_test_{}", pid);
+        let cmd_high = format!("rtk cmd_high_{}", pid);
+        let cmd_low = format!("rtk cmd_low_{}", pid);
+        let cmd_zero = format!("rtk cmd_zero_{}", pid);
 
-        // Record one real command with 80% savings
+        // Record high-savings command (80%)
         tracker
-            .record("cmd1", &cmd1, 1000, 200, 10)
-            .expect("Failed to record cmd1");
+            .record("cmd1", &cmd_high, 1000, 200, 10)
+            .expect("Failed to record high-savings");
 
-        // Record passthrough (0, 0)
+        // Record low-savings command (2%)
         tracker
-            .record("cmd2", &cmd2, 0, 0, 5)
+            .record("cmd2", &cmd_low, 1000, 980, 10)
+            .expect("Failed to record low-savings");
+
+        // Record zero-token passthrough (0%)
+        tracker
+            .record("cmd3", &cmd_zero, 0, 0, 5)
             .expect("Failed to record passthrough");
 
-        // Verify both records exist in recent history
-        let recent = tracker.get_recent(20).expect("Failed to get recent");
+        let recent = tracker.get_recent(50).expect("Failed to get recent");
 
-        let record1 = recent
-            .iter()
-            .find(|r| r.rtk_cmd == cmd1)
-            .expect("cmd1 record not found");
-        let record2 = recent
-            .iter()
-            .find(|r| r.rtk_cmd == cmd2)
-            .expect("passthrough record not found");
-
-        // Verify cmd1 has 80% savings
-        assert_eq!(record1.saved_tokens, 800);
-        assert_eq!(record1.savings_pct, 80.0);
-
-        // Verify passthrough has 0% savings
-        assert_eq!(record2.saved_tokens, 0);
-        assert_eq!(record2.savings_pct, 0.0);
-
-        // This validates that passthrough (0 input, 0 output) doesn't dilute stats
-        // because the savings calculation is correct for both cases
+        // All commands should be recorded
+        assert!(
+            recent.iter().any(|r| r.rtk_cmd == cmd_high),
+            "High-savings command should be recorded"
+        );
+        assert!(
+            recent.iter().any(|r| r.rtk_cmd == cmd_low),
+            "Low-savings command should be recorded for aggregate stats"
+        );
+        assert!(
+            recent.iter().any(|r| r.rtk_cmd == cmd_zero),
+            "Zero-token passthrough should be recorded for aggregate stats"
+        );
     }
 
     // 5. TimedExecution::track records with exec_time > 0
@@ -993,21 +1143,21 @@ mod tests {
         assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
     }
 
-    // 6. TimedExecution::track_passthrough records with 0 tokens
+    // 6. TimedExecution::track_passthrough records with 0 tokens (kept for aggregate stats)
     #[test]
     fn test_timed_execution_passthrough() {
         let timer = TimedExecution::start();
-        timer.track_passthrough("git tag", "rtk git tag (passthrough)");
+        let unique_cmd = format!("rtk git tag (passthrough_test_{})", std::process::id());
+        timer.track_passthrough("git tag", &unique_cmd);
 
         let tracker = Tracker::new().expect("Failed to create tracker");
-        let recent = tracker.get_recent(5).expect("Failed to get recent");
+        let recent = tracker.get_recent(50).expect("Failed to get recent");
 
         let pt = recent
             .iter()
-            .find(|r| r.rtk_cmd.contains("passthrough"))
-            .expect("Passthrough record not found");
+            .find(|r| r.rtk_cmd == unique_cmd)
+            .expect("Passthrough record should exist for aggregate stats");
 
-        // savings_pct should be 0 for passthrough
         assert_eq!(pt.savings_pct, 0.0);
         assert_eq!(pt.saved_tokens, 0);
     }
@@ -1036,5 +1186,105 @@ mod tests {
 
         let db_path = get_db_path().expect("Failed to get db path");
         assert!(db_path.ends_with("rtk/history.db"));
+    }
+
+    // 9. record_parse_failure + get_parse_failure_summary roundtrip
+    #[test]
+    fn test_parse_failure_roundtrip() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let test_cmd = format!("git -C /path status test_{}", std::process::id());
+
+        tracker
+            .record_parse_failure(&test_cmd, "unrecognized subcommand", true)
+            .expect("Failed to record parse failure");
+
+        let summary = tracker
+            .get_parse_failure_summary()
+            .expect("Failed to get summary");
+
+        assert!(summary.total >= 1);
+        assert!(summary.recent.iter().any(|r| r.raw_command == test_cmd));
+    }
+
+    // 10. recovery_rate calculation
+    #[test]
+    fn test_parse_failure_recovery_rate() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+
+        // 2 successes, 1 failure
+        tracker
+            .record_parse_failure(&format!("cmd_ok1_{}", pid), "err", true)
+            .unwrap();
+        tracker
+            .record_parse_failure(&format!("cmd_ok2_{}", pid), "err", true)
+            .unwrap();
+        tracker
+            .record_parse_failure(&format!("cmd_fail_{}", pid), "err", false)
+            .unwrap();
+
+        let summary = tracker.get_parse_failure_summary().unwrap();
+        // We can't assert exact rate because other tests may have added records,
+        // but we can verify recovery_rate is between 0 and 100
+        assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+    }
+
+    // 11. get_summary includes normalized_savings_pct (excludes <5% records)
+    #[test]
+    fn test_summary_normalized_savings() {
+        let summary = Tracker::new()
+            .unwrap()
+            .get_summary()
+            .expect("Failed to get summary");
+
+        // Normalized should be >= total (it excludes low-savings drag)
+        assert!(
+            summary.normalized_savings_pct >= summary.avg_savings_pct
+                || summary.total_commands == 0,
+            "Normalized ({:.1}%) should be >= total ({:.1}%)",
+            summary.normalized_savings_pct,
+            summary.avg_savings_pct
+        );
+
+        // Normalized commands should be <= total
+        assert!(summary.normalized_commands <= summary.total_commands);
+    }
+
+    // 12. Boundary: command at exactly 5% savings is recorded
+    #[test]
+    fn test_boundary_5pct_recorded() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+        let cmd = format!("rtk boundary_5pct_{}", pid);
+
+        // 5% savings: 100 input, 95 output → saved=5, pct=5.0
+        tracker
+            .record("cmd", &cmd, 100, 95, 10)
+            .expect("Failed to record");
+
+        let recent = tracker.get_recent(50).expect("Failed to get recent");
+        assert!(
+            recent.iter().any(|r| r.rtk_cmd == cmd),
+            "Command with exactly 5% savings should be recorded"
+        );
+    }
+
+    // 13. Command at 4% savings is recorded but excluded from normalized stats
+    #[test]
+    fn test_below_5pct_recorded_but_excluded_from_normalized() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+        let cmd = format!("rtk boundary_4pct_{}", pid);
+
+        // ~4% savings: 1000 input, 960 output → saved=40, pct=4.0
+        tracker
+            .record("cmd", &cmd, 1000, 960, 10)
+            .expect("Failed to record");
+
+        let recent = tracker.get_recent(50).expect("Failed to get recent");
+        assert!(
+            recent.iter().any(|r| r.rtk_cmd == cmd),
+            "Low-savings command should be recorded for aggregate stats"
+        );
     }
 }

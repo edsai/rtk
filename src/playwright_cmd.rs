@@ -140,7 +140,7 @@ fn collect_test_results(
 fn extract_playwright_regex(output: &str) -> Option<TestResult> {
     lazy_static::lazy_static! {
         static ref SUMMARY_RE: Regex = Regex::new(
-            r"(\d+)\s+(passed|failed|flaky|skipped)"
+            r"(\d+)\s+(passed|failed|flaky|skipped|did not run)"
         ).unwrap();
         static ref DURATION_RE: Regex = Regex::new(
             r"\((\d+(?:\.\d+)?)(ms|s|m)\)"
@@ -159,7 +159,7 @@ fn extract_playwright_regex(output: &str) -> Option<TestResult> {
         match &caps[2] {
             "passed" => passed = count,
             "failed" => failed = count,
-            "skipped" => skipped = count,
+            "skipped" | "did not run" => skipped += count,
             _ => {}
         }
     }
@@ -195,8 +195,9 @@ fn extract_playwright_regex(output: &str) -> Option<TestResult> {
 /// Extract failures using regex
 fn extract_failures_regex(output: &str) -> Vec<TestFailure> {
     lazy_static::lazy_static! {
+        // Match .spec.ts, .setup.ts, .test.ts etc.
         static ref TEST_PATTERN: Regex = Regex::new(
-            r"[×✗]\s+.*?›\s+([^›]+\.spec\.[tj]sx?)"
+            r"[×✗]\s+.*?›\s+([^›]+\.(?:spec|setup|test)\.[tj]sx?)"
         ).unwrap();
     }
 
@@ -221,8 +222,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
 
     let mut cmd = package_manager_exec("playwright");
 
-    // Add JSON reporter for structured output
-    cmd.arg("--reporter=json");
+    // Don't force --reporter=json. Let Playwright use its default reporter
+    // (or whatever the user/config specifies). Tier 1 JSON parsing still works
+    // if the user explicitly passes --reporter=json. Tier 2 regex handles the
+    // default human-readable output (list/line reporters).
 
     for arg in args {
         cmd.arg(arg);
@@ -240,8 +243,16 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
 
-    // Parse output using PlaywrightParser
-    let parse_result = PlaywrightParser::parse(&stdout);
+    // Try parsing stdout first (JSON reporter writes here), then fall back
+    // to combined stdout+stderr (default reporters may write to either).
+    let parse_result = {
+        let r = PlaywrightParser::parse(&stdout);
+        if r.is_ok() {
+            r
+        } else {
+            PlaywrightParser::parse(&raw)
+        }
+    };
     let mode = FormatMode::from_verbosity(verbose);
 
     let filtered = match parse_result {
@@ -328,6 +339,42 @@ mod tests {
         let data = result.unwrap();
         assert_eq!(data.passed, 3);
         assert_eq!(data.failed, 0);
+    }
+
+    #[test]
+    fn test_playwright_parser_regex_with_failures_and_did_not_run() {
+        // Real Playwright output when auth setup fails
+        let text = "  4 failed\n  5 did not run\n";
+        let result = PlaywrightParser::parse(text);
+        assert_eq!(result.tier(), 2);
+        assert!(result.is_ok());
+
+        let data = result.unwrap();
+        assert_eq!(data.failed, 4);
+        assert_eq!(data.skipped, 5); // "did not run" maps to skipped
+        assert_eq!(data.total, 9);
+    }
+
+    #[test]
+    fn test_playwright_parser_regex_mixed_results() {
+        let text = "  10 passed\n  2 failed\n  3 skipped (15.2s)\n";
+        let result = PlaywrightParser::parse(text);
+        assert_eq!(result.tier(), 2);
+
+        let data = result.unwrap();
+        assert_eq!(data.passed, 10);
+        assert_eq!(data.failed, 2);
+        assert_eq!(data.skipped, 3);
+        assert_eq!(data.total, 15);
+        assert_eq!(data.duration_ms, Some(15200));
+    }
+
+    #[test]
+    fn test_playwright_failure_regex_matches_setup_files() {
+        let output = "  ✗ [setup] › tests/auth.setup.ts:27:6 › authenticate as admin";
+        let failures = extract_failures_regex(output);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].file_path.contains("auth.setup.ts"));
     }
 
     #[test]

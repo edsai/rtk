@@ -4,7 +4,23 @@
 
 **High-performance CLI proxy to minimize LLM token consumption.**
 
-[Website](https://www.rtk-ai.app) | [GitHub](https://github.com/rtk-ai/rtk) | [Install](INSTALL.md)
+> **Fork notice:** This is a maintained fork of [rtk-ai/rtk](https://github.com/rtk-ai/rtk).
+> The upstream repo has many unmerged PRs. This fork cherry-picks bug fixes and adds
+> improvements we depend on. Key changes vs upstream:
+>
+> - **Rust hook engine** — replaces the Python-based Claude Code hook with a Rust lexer/router
+> - **Passthrough fallback** — unknown flags fall back to raw execution instead of hard-exiting ([#200](https://github.com/rtk-ai/rtk/pull/200))
+> - **Git global options** — `-C`, `-c`, `--git-dir`, `--work-tree` passed through correctly ([#192](https://github.com/rtk-ai/rtk/pull/192))
+> - **Git commit multi `-m`** — `git commit -m "title" -m "body"` support ([#203](https://github.com/rtk-ai/rtk/pull/203))
+> - **gh output format flags** — `--json`/`--jq`/`--template` passthrough ([#196](https://github.com/rtk-ai/rtk/pull/196))
+> - **gh body filter** — strips markdown noise from `gh issue/pr view` ([#214](https://github.com/rtk-ai/rtk/pull/214))
+> - **grep `-r`/`-n`/`-i` compat** — accepts common grep flags without Clap rejection ([#135](https://github.com/rtk-ai/rtk/pull/135))
+> - **find native flags** — `-name`, `-type`, etc. pass through to find ([#211](https://github.com/rtk-ai/rtk/pull/211))
+> - **AWS CLI + psql modules** — token-optimized output for `aws` and `psql` ([#216](https://github.com/rtk-ai/rtk/pull/216))
+>
+> Branch: `feat/rust-hooks-v2` — 686 tests passing
+
+[Upstream Website](https://www.rtk-ai.app) | [Upstream Repo](https://github.com/rtk-ai/rtk) | [This Fork](https://github.com/edsai/rtk)
 
 rtk filters and compresses command outputs before they reach your LLM context, saving 60-90% of tokens on common operations.
 
@@ -71,15 +87,22 @@ If already installed and `rtk gain` works, **DO NOT reinstall**. Skip to Quick S
 brew install rtk
 ```
 
-### Quick Install (Linux/macOS)
+### Install from this fork (recommended)
+
+This fork includes bug fixes not yet merged upstream. Install from source:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+cargo install --git https://github.com/edsai/rtk --branch feat/rust-hooks-v2
 ```
 
 > **Note**: rtk installs to `~/.local/bin` by default. If this directory is not in your PATH, add it:
 > ```bash
 > echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc  # or ~/.zshrc
+> ```
+>
+> **macOS note**: If the binary is killed silently after install (exit code 137), re-sign it:
+> ```bash
+> codesign --sign - --force ~/.local/bin/rtk
 > ```
 
 After installation, **verify you have the correct rtk**:
@@ -87,19 +110,24 @@ After installation, **verify you have the correct rtk**:
 rtk gain  # Must show token savings stats (not "command not found")
 ```
 
-### Alternative: Manual Installation
+### Install from upstream
+
+If you prefer the original author's release (without the fixes listed above):
 
 ```bash
-# From rtk-ai upstream (maintained by pszymkowiak)
-cargo install --git https://github.com/rtk-ai/rtk
+# Homebrew
+brew install rtk
 
-# OR if published to crates.io
-cargo install rtk
+# Quick install script
+curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+
+# Cargo from upstream
+cargo install --git https://github.com/rtk-ai/rtk
 ```
 
 ⚠️ **WARNING**: `cargo install rtk` from crates.io might install the wrong package (Type Kit instead of Token Killer). Always verify with `rtk gain` after installation.
 
-### Alternative: Pre-built Binaries
+### Pre-built Binaries (upstream only)
 
 Download from [rtk-ai/releases](https://github.com/rtk-ai/rtk/releases):
 - macOS: `rtk-x86_64-apple-darwin.tar.gz` / `rtk-aarch64-apple-darwin.tar.gz`

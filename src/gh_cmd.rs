@@ -8,8 +8,105 @@ use crate::json_cmd;
 use crate::tracking;
 use crate::utils::{ok_confirmation, truncate};
 use anyhow::{Context, Result};
+use lazy_static::lazy_static;
+use regex::Regex;
 use serde_json::Value;
 use std::process::Command;
+
+lazy_static! {
+    static ref HTML_COMMENT_RE: Regex = Regex::new(r"(?s)<!--.*?-->").unwrap();
+    static ref BADGE_LINE_RE: Regex =
+        Regex::new(r"(?m)^\s*\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)\s*$").unwrap();
+    static ref IMAGE_ONLY_LINE_RE: Regex = Regex::new(r"(?m)^\s*!\[[^\]]*\]\([^)]*\)\s*$").unwrap();
+    static ref HORIZONTAL_RULE_RE: Regex =
+        Regex::new(r"(?m)^\s*(?:---+|\*\*\*+|___+)\s*$").unwrap();
+    static ref MULTI_BLANK_RE: Regex = Regex::new(r"\n{3,}").unwrap();
+}
+
+/// Filter markdown body to remove noise while preserving meaningful content.
+/// Removes HTML comments, badge lines, image-only lines, horizontal rules,
+/// and collapses excessive blank lines. Preserves code blocks untouched.
+fn filter_markdown_body(body: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+
+    // Split into code blocks and non-code segments
+    let mut result = String::new();
+    let mut remaining = body;
+
+    loop {
+        // Find next code block opening (``` or ~~~)
+        let fence_pos = remaining
+            .find("```")
+            .or_else(|| remaining.find("~~~"))
+            .map(|pos| {
+                let fence = if remaining[pos..].starts_with("```") {
+                    "```"
+                } else {
+                    "~~~"
+                };
+                (pos, fence)
+            });
+
+        match fence_pos {
+            Some((start, fence)) => {
+                // Filter the text before the code block
+                let before = &remaining[..start];
+                result.push_str(&filter_markdown_segment(before));
+
+                // Find the closing fence
+                let after_open = start + fence.len();
+                // Skip past the opening fence line
+                let code_start = remaining[after_open..]
+                    .find('\n')
+                    .map(|p| after_open + p + 1)
+                    .unwrap_or(remaining.len());
+
+                let close_pos = remaining[code_start..]
+                    .find(fence)
+                    .map(|p| code_start + p + fence.len());
+
+                match close_pos {
+                    Some(end) => {
+                        // Preserve the entire code block as-is
+                        result.push_str(&remaining[start..end]);
+                        // Include the rest of the closing fence line
+                        let after_close = remaining[end..]
+                            .find('\n')
+                            .map(|p| end + p + 1)
+                            .unwrap_or(remaining.len());
+                        result.push_str(&remaining[end..after_close]);
+                        remaining = &remaining[after_close..];
+                    }
+                    None => {
+                        // Unclosed code block — preserve everything
+                        result.push_str(&remaining[start..]);
+                        remaining = "";
+                    }
+                }
+            }
+            None => {
+                // No more code blocks, filter the rest
+                result.push_str(&filter_markdown_segment(remaining));
+                break;
+            }
+        }
+    }
+
+    // Final cleanup: trim trailing whitespace
+    result.trim().to_string()
+}
+
+/// Filter a markdown segment that is NOT inside a code block.
+fn filter_markdown_segment(text: &str) -> String {
+    let mut s = HTML_COMMENT_RE.replace_all(text, "").to_string();
+    s = BADGE_LINE_RE.replace_all(&s, "").to_string();
+    s = IMAGE_ONLY_LINE_RE.replace_all(&s, "").to_string();
+    s = HORIZONTAL_RULE_RE.replace_all(&s, "").to_string();
+    s = MULTI_BLANK_RE.replace_all(&s, "\n\n").to_string();
+    s
+}
 
 /// Run a gh command with token-optimized output
 pub fn run(subcommand: &str, args: &[String], verbose: u8, ultra_compact: bool) -> Result<()> {
@@ -35,7 +132,7 @@ fn run_pr(args: &[String], verbose: u8, ultra_compact: bool) -> Result<()> {
         "list" => list_prs(&args[1..], verbose, ultra_compact),
         "view" => view_pr(&args[1..], verbose, ultra_compact),
         "checks" => pr_checks(&args[1..], verbose, ultra_compact),
-        "status" => pr_status(verbose, ultra_compact),
+        "status" => pr_status(&args[1..], verbose, ultra_compact),
         "create" => pr_create(&args[1..], verbose),
         "merge" => pr_merge(&args[1..], verbose),
         "diff" => pr_diff(&args[1..], verbose),
@@ -46,6 +143,10 @@ fn run_pr(args: &[String], verbose: u8, ultra_compact: bool) -> Result<()> {
 }
 
 fn list_prs(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
+    if has_output_format_flags(args) {
+        return run_passthrough_with_extra("gh", &["pr", "list"], args);
+    }
+
     let timer = tracking::TimedExecution::start();
 
     let mut cmd = Command::new("gh");
@@ -130,31 +231,44 @@ fn list_prs(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
 }
 
 fn view_pr(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
-
-    if args.is_empty() {
-        return Err(anyhow::anyhow!("PR number required"));
+    // When the caller supplies their own output-format flags, pass through so
+    // RTK doesn't clobber them with its hardcoded --json fields.
+    if has_output_format_flags(args) {
+        return run_passthrough_with_extra("gh", &["pr", "view"], args);
     }
 
-    let pr_number = &args[0];
+    let timer = tracking::TimedExecution::start();
+
+    // First non-flag arg is the PR identifier (number, URL, or branch).
+    // When omitted, gh defaults to the current branch's PR.
+    let (pr_ref, extra_args) = match args.first() {
+        Some(arg) if !arg.starts_with('-') => (Some(arg.as_str()), &args[1..]),
+        _ => (None, args.as_ref()),
+    };
 
     let mut cmd = Command::new("gh");
+    cmd.args(["pr", "view"]);
+    if let Some(pr) = pr_ref {
+        cmd.arg(pr);
+    }
     cmd.args([
-        "pr",
-        "view",
-        pr_number,
         "--json",
         "number,title,state,author,body,url,mergeable,reviews,statusCheckRollup",
     ]);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
 
     let output = cmd.output().context("Failed to run gh pr view")?;
     let raw = String::from_utf8_lossy(&output.stdout).to_string();
 
+    let pr_label = pr_ref.unwrap_or("(current)");
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         timer.track(
-            &format!("gh pr view {}", pr_number),
-            &format!("rtk gh pr view {}", pr_number),
+            &format!("gh pr view {}", pr_label),
+            &format!("rtk gh pr view {}", pr_label),
             &stderr,
             &stderr,
         );
@@ -273,29 +387,25 @@ fn view_pr(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
     filtered.push_str(&line);
     print!("{}", line);
 
-    // Show body summary (first 3 lines max)
+    // Show filtered body
     if let Some(body) = json["body"].as_str() {
         if !body.is_empty() {
-            filtered.push('\n');
-            println!();
-            for line in body.lines().take(3) {
-                if !line.trim().is_empty() {
-                    let formatted = format!("  {}\n", truncate(line, 80));
+            let body_filtered = filter_markdown_body(body);
+            if !body_filtered.is_empty() {
+                filtered.push('\n');
+                println!();
+                for line in body_filtered.lines() {
+                    let formatted = format!("  {}\n", line);
                     filtered.push_str(&formatted);
                     print!("{}", formatted);
                 }
-            }
-            if body.lines().count() > 3 {
-                let line = format!("  ... (gh pr view {} for full)\n", pr_number);
-                filtered.push_str(&line);
-                print!("{}", line);
             }
         }
     }
 
     timer.track(
-        &format!("gh pr view {}", pr_number),
-        &format!("rtk gh pr view {}", pr_number),
+        &format!("gh pr view {}", pr_label),
+        &format!("rtk gh pr view {}", pr_label),
         &raw,
         &filtered,
     );
@@ -388,7 +498,11 @@ fn pr_checks(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<()> 
     Ok(())
 }
 
-fn pr_status(_verbose: u8, _ultra_compact: bool) -> Result<()> {
+fn pr_status(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<()> {
+    if has_output_format_flags(args) {
+        return run_passthrough_with_extra("gh", &["pr", "status"], args);
+    }
+
     let timer = tracking::TimedExecution::start();
 
     let mut cmd = Command::new("gh");
@@ -445,6 +559,10 @@ fn run_issue(args: &[String], verbose: u8, ultra_compact: bool) -> Result<()> {
 }
 
 fn list_issues(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
+    if has_output_format_flags(args) {
+        return run_passthrough_with_extra("gh", &["issue", "list"], args);
+    }
+
     let timer = tracking::TimedExecution::start();
 
     let mut cmd = Command::new("gh");
@@ -512,6 +630,10 @@ fn list_issues(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()>
 }
 
 fn view_issue(args: &[String], _verbose: u8) -> Result<()> {
+    if has_output_format_flags(args) {
+        return run_passthrough_with_extra("gh", &["issue", "view"], args);
+    }
+
     let timer = tracking::TimedExecution::start();
 
     if args.is_empty() {
@@ -575,12 +697,13 @@ fn view_issue(args: &[String], _verbose: u8) -> Result<()> {
 
     if let Some(body) = json["body"].as_str() {
         if !body.is_empty() {
-            let line = "\n  Description:\n";
-            filtered.push_str(line);
-            print!("{}", line);
-            for line in body.lines().take(3) {
-                if !line.trim().is_empty() {
-                    let formatted = format!("    {}\n", truncate(line, 80));
+            let body_filtered = filter_markdown_body(body);
+            if !body_filtered.is_empty() {
+                let line = "\n  Description:\n";
+                filtered.push_str(line);
+                print!("{}", line);
+                for line in body_filtered.lines() {
+                    let formatted = format!("    {}\n", line);
                     filtered.push_str(&formatted);
                     print!("{}", formatted);
                 }
@@ -610,6 +733,10 @@ fn run_workflow(args: &[String], verbose: u8, ultra_compact: bool) -> Result<()>
 }
 
 fn list_runs(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
+    if has_output_format_flags(args) {
+        return run_passthrough_with_extra("gh", &["run", "list"], args);
+    }
+
     let timer = tracking::TimedExecution::start();
 
     let mut cmd = Command::new("gh");
@@ -692,13 +819,22 @@ fn list_runs(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
     Ok(())
 }
 
+/// Check if args contain output-format flags (--json, --jq, --template) that
+/// indicate the caller wants specific unfiltered output.  When present, RTK
+/// should passthrough to gh directly instead of applying its own formatting.
+fn has_output_format_flags(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--json" || a == "--jq" || a == "-q" || a == "--template" || a == "-t")
+}
+
 /// Check if run view args should bypass filtering and pass through directly.
 /// Flags like --log-failed, --log, and --json produce output that the filter
 /// would incorrectly strip.
 fn should_passthrough_run_view(extra_args: &[String]) -> bool {
-    extra_args
-        .iter()
-        .any(|a| a == "--log-failed" || a == "--log" || a == "--json")
+    has_output_format_flags(extra_args)
+        || extra_args
+            .iter()
+            .any(|a| a == "--log-failed" || a == "--log")
 }
 
 fn view_run(args: &[String], _verbose: u8) -> Result<()> {
@@ -776,6 +912,10 @@ fn view_run(args: &[String], _verbose: u8) -> Result<()> {
 }
 
 fn run_repo(args: &[String], _verbose: u8, _ultra_compact: bool) -> Result<()> {
+    if has_output_format_flags(args) {
+        return run_passthrough_with_extra("gh", &["repo"], args);
+    }
+
     // Parse subcommand (default to "view")
     let (subcommand, rest_args) = if args.is_empty() {
         ("view", args)
@@ -1209,5 +1349,197 @@ mod tests {
     #[test]
     fn test_run_view_no_passthrough_other_flags() {
         assert!(!should_passthrough_run_view(&["--web".into()]));
+    }
+
+    // --- filter_markdown_body tests ---
+
+    #[test]
+    fn test_filter_markdown_body_html_comment_single_line() {
+        let input = "Hello\n<!-- this is a comment -->\nWorld";
+        let result = filter_markdown_body(input);
+        assert!(!result.contains("<!--"));
+        assert!(result.contains("Hello"));
+        assert!(result.contains("World"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_html_comment_multiline() {
+        let input = "Before\n<!--\nmultiline\ncomment\n-->\nAfter";
+        let result = filter_markdown_body(input);
+        assert!(!result.contains("<!--"));
+        assert!(!result.contains("multiline"));
+        assert!(result.contains("Before"));
+        assert!(result.contains("After"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_badge_lines() {
+        let input = "# Title\n[![CI](https://img.shields.io/badge.svg)](https://github.com/actions)\nSome text";
+        let result = filter_markdown_body(input);
+        assert!(!result.contains("shields.io"));
+        assert!(result.contains("# Title"));
+        assert!(result.contains("Some text"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_image_only_lines() {
+        let input = "# Title\n![screenshot](https://example.com/img.png)\nSome text";
+        let result = filter_markdown_body(input);
+        assert!(!result.contains("![screenshot]"));
+        assert!(result.contains("# Title"));
+        assert!(result.contains("Some text"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_horizontal_rules() {
+        let input = "Section 1\n---\nSection 2\n***\nSection 3\n___\nEnd";
+        let result = filter_markdown_body(input);
+        assert!(!result.contains("---"));
+        assert!(!result.contains("***"));
+        assert!(!result.contains("___"));
+        assert!(result.contains("Section 1"));
+        assert!(result.contains("Section 2"));
+        assert!(result.contains("Section 3"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_blank_lines_collapse() {
+        let input = "Line 1\n\n\n\n\nLine 2";
+        let result = filter_markdown_body(input);
+        // Should collapse to at most one blank line (2 newlines)
+        assert!(!result.contains("\n\n\n"));
+        assert!(result.contains("Line 1"));
+        assert!(result.contains("Line 2"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_code_block_preserved() {
+        let input = "Text before\n```python\n<!-- not a comment -->\n![not an image](url)\n---\n```\nText after";
+        let result = filter_markdown_body(input);
+        // Content inside code block should be preserved
+        assert!(result.contains("<!-- not a comment -->"));
+        assert!(result.contains("![not an image](url)"));
+        assert!(result.contains("---"));
+        assert!(result.contains("Text before"));
+        assert!(result.contains("Text after"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_empty() {
+        assert_eq!(filter_markdown_body(""), "");
+    }
+
+    #[test]
+    fn test_filter_markdown_body_meaningful_content_preserved() {
+        let input = "## Summary\n- Item 1\n- Item 2\n\n[Link](https://example.com)\n\n| Col1 | Col2 |\n| --- | --- |\n| a | b |";
+        let result = filter_markdown_body(input);
+        assert!(result.contains("## Summary"));
+        assert!(result.contains("- Item 1"));
+        assert!(result.contains("- Item 2"));
+        assert!(result.contains("[Link](https://example.com)"));
+        assert!(result.contains("| Col1 | Col2 |"));
+    }
+
+    #[test]
+    fn test_filter_markdown_body_token_savings() {
+        // Realistic PR body with noise
+        let input = r#"<!-- This PR template is auto-generated -->
+<!-- Please fill in the following sections -->
+
+## Summary
+
+Added smart markdown filtering for gh issue/pr view commands.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/rtk-ai/rtk/ci.yml)](https://github.com/rtk-ai/rtk/actions)
+[![Coverage](https://img.shields.io/codecov/c/github/rtk-ai/rtk)](https://codecov.io/gh/rtk-ai/rtk)
+
+![screenshot](https://user-images.githubusercontent.com/123/screenshot.png)
+
+---
+
+## Changes
+
+- Filter HTML comments
+- Filter badge lines
+- Filter image-only lines
+- Collapse blank lines
+
+***
+
+## Test Plan
+
+- [x] Unit tests added
+- [x] Snapshot tests pass
+- [ ] Manual testing
+
+___
+
+<!-- Do not edit below this line -->
+<!-- Auto-generated footer -->"#;
+
+        let result = filter_markdown_body(input);
+
+        fn count_tokens(text: &str) -> usize {
+            text.split_whitespace().count()
+        }
+
+        let input_tokens = count_tokens(input);
+        let output_tokens = count_tokens(&result);
+        let savings = 100.0 - (output_tokens as f64 / input_tokens as f64 * 100.0);
+
+        assert!(
+            savings >= 30.0,
+            "Expected ≥30% savings, got {:.1}% (input: {} tokens, output: {} tokens)",
+            savings,
+            input_tokens,
+            output_tokens
+        );
+
+        // Verify meaningful content preserved
+        assert!(result.contains("## Summary"));
+        assert!(result.contains("## Changes"));
+        assert!(result.contains("## Test Plan"));
+        assert!(result.contains("Filter HTML comments"));
+    }
+
+    // --- output format flag tests ---
+
+    #[test]
+    fn test_has_output_format_flags_json() {
+        assert!(has_output_format_flags(&[
+            "--json".into(),
+            "number,title".into()
+        ]));
+    }
+
+    #[test]
+    fn test_has_output_format_flags_jq() {
+        assert!(has_output_format_flags(&["--jq".into(), ".title".into()]));
+        assert!(has_output_format_flags(&["-q".into(), ".title".into()]));
+    }
+
+    #[test]
+    fn test_has_output_format_flags_template() {
+        assert!(has_output_format_flags(&[
+            "--template".into(),
+            "{{.title}}".into()
+        ]));
+        assert!(has_output_format_flags(&["-t".into(), "{{.title}}".into()]));
+    }
+
+    #[test]
+    fn test_has_output_format_flags_none() {
+        assert!(!has_output_format_flags(&[]));
+        assert!(!has_output_format_flags(&["--web".into()]));
+        assert!(!has_output_format_flags(&["123".into()]));
+    }
+
+    #[test]
+    fn test_has_output_format_flags_mixed_with_other_args() {
+        assert!(has_output_format_flags(&[
+            "123".into(),
+            "--json".into(),
+            "number,title".into()
+        ]));
     }
 }

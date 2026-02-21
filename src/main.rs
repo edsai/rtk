@@ -1,6 +1,8 @@
+mod aws_cmd;
 mod cargo_cmd;
 mod cc_economics;
 mod ccusage;
+mod cmd;
 mod config;
 mod container;
 mod curl_cmd;
@@ -34,6 +36,7 @@ mod playwright_cmd;
 mod pnpm_cmd;
 mod prettier_cmd;
 mod prisma_cmd;
+mod psql_cmd;
 mod pytest_cmd;
 mod read;
 mod ruff_cmd;
@@ -49,6 +52,7 @@ mod wc_cmd;
 mod wget_cmd;
 
 use anyhow::{Context, Result};
+use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -122,6 +126,22 @@ enum Commands {
 
     /// Git commands with compact output
     Git {
+        /// Change to directory before executing (like git -C <path>, can be repeated)
+        #[arg(short = 'C', action = clap::ArgAction::Append)]
+        directory: Vec<String>,
+
+        /// Git configuration override (like git -c key=value, can be repeated)
+        #[arg(short = 'c', action = clap::ArgAction::Append)]
+        config_override: Vec<String>,
+
+        /// Set the path to the .git directory
+        #[arg(long = "git-dir")]
+        git_dir: Option<String>,
+
+        /// Set the path to the working tree
+        #[arg(long = "work-tree")]
+        work_tree: Option<String>,
+
         #[command(subcommand)]
         command: GitCommands,
     },
@@ -131,6 +151,22 @@ enum Commands {
         /// Subcommand: pr, issue, run, repo
         subcommand: String,
         /// Additional arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// AWS CLI with compact output (force JSON, compress)
+    Aws {
+        /// AWS service subcommand (e.g., sts, s3, ec2, ecs, rds, cloudformation)
+        subcommand: String,
+        /// Additional arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// PostgreSQL client with compact output (strip borders, compress tables)
+    Psql {
+        /// psql arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -181,19 +217,11 @@ enum Commands {
         show_all: bool,
     },
 
-    /// Find files with compact tree output
+    /// Find files with compact tree output (accepts native find flags like -name, -type)
     Find {
-        /// Pattern to search (glob)
-        pattern: String,
-        /// Path to search in
-        #[arg(default_value = ".")]
-        path: String,
-        /// Maximum results to show
-        #[arg(short, long, default_value = "50")]
-        max: usize,
-        /// Filter by type: f (file), d (directory)
-        #[arg(short = 't', long, default_value = "f")]
-        file_type: String,
+        /// All find arguments (supports both RTK and native find syntax)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
     /// Ultra-condensed diff (only changed lines)
@@ -248,7 +276,16 @@ enum Commands {
         /// Filter by file type (e.g., ts, py, rust)
         #[arg(short = 't', long)]
         file_type: Option<String>,
-        /// Extra ripgrep arguments (e.g., -i, -A 3, -w, --glob)
+        /// Show line numbers (always on, accepted for grep/rg compatibility)
+        #[arg(short = 'n', long)]
+        line_numbers: bool,
+        /// Recursive search (always on in rg, accepted for grep compatibility)
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        /// Case-insensitive search (passed through to rg)
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+        /// Extra ripgrep arguments (e.g., -A 3, -w, --glob)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
@@ -332,6 +369,9 @@ enum Commands {
         /// Output format: text, json, csv
         #[arg(short, long, default_value = "text")]
         format: String,
+        /// Show parse failure log (commands that fell back to raw execution)
+        #[arg(short = 'F', long)]
+        failures: bool,
     },
 
     /// Claude Code economics: spending (ccusage) vs savings (rtk) analysis
@@ -534,6 +574,34 @@ enum Commands {
         #[arg(short, long, default_value = "7")]
         since: u64,
     },
+
+    /// Run command with safety checks and token-optimized output
+    Run {
+        /// Command string to execute
+        #[arg(short = 'c', long)]
+        command: String,
+    },
+
+    /// Hook protocol for Claude Code integration
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCommands {
+    /// Check command for safety and rewrite (text protocol for debugging)
+    Check {
+        /// Agent type: claude or gemini
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// Command to check
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Claude Code JSON protocol handler (reads stdin, writes stdout)
+    Claude,
 }
 
 #[derive(Subcommand)]
@@ -570,9 +638,9 @@ enum GitCommands {
     },
     /// Commit → "ok ✓ \<hash\>"
     Commit {
-        /// Commit message
+        /// Commit message (can be repeated for multi-paragraph)
         #[arg(short, long)]
-        message: String,
+        message: Vec<String>,
     },
     /// Push → "ok ✓ \<branch\>"
     Push {
@@ -849,8 +917,59 @@ enum GoCommands {
     Other(Vec<OsString>),
 }
 
+fn run_fallback(parse_error: clap::Error) -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // No args → show Clap's error (user ran just "rtk" with bad syntax)
+    if args.is_empty() {
+        parse_error.exit();
+    }
+
+    eprintln!("[rtk: parse failed, running raw]");
+
+    let status = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+
+    let raw_command = args.join(" ");
+    let error_message = parse_error.to_string();
+
+    match status {
+        Ok(s) => {
+            // Track as passthrough
+            let timer = tracking::TimedExecution::start();
+            timer.track_passthrough(&raw_command, &format!("rtk fallback: {}", raw_command));
+
+            tracking::record_parse_failure_silent(&raw_command, &error_message, true);
+
+            if !s.success() {
+                std::process::exit(s.code().unwrap_or(1));
+            }
+        }
+        Err(e) => {
+            tracking::record_parse_failure_silent(&raw_command, &error_message, false);
+            // Command not found or other OS error — show Clap's original error
+            eprintln!("[rtk: fallback failed: {}]", e);
+            parse_error.exit();
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                e.exit();
+            }
+            return run_fallback(e);
+        }
+    };
 
     match cli.command {
         Commands::Ls { args } => {
@@ -882,55 +1001,145 @@ fn main() -> Result<()> {
             local_llm::run(&file, &model, force_download, cli.verbose)?;
         }
 
-        Commands::Git { command } => match command {
-            GitCommands::Diff { args } => {
-                git::run(git::GitCommand::Diff, &args, None, cli.verbose)?;
+        Commands::Git {
+            directory,
+            config_override,
+            git_dir,
+            work_tree,
+            command,
+        } => {
+            // Build global git args (inserted between "git" and subcommand)
+            let mut global_args: Vec<String> = Vec::new();
+            for dir in &directory {
+                global_args.push("-C".to_string());
+                global_args.push(dir.clone());
             }
-            GitCommands::Log { args } => {
-                git::run(git::GitCommand::Log, &args, None, cli.verbose)?;
+            for cfg in &config_override {
+                global_args.push("-c".to_string());
+                global_args.push(cfg.clone());
             }
-            GitCommands::Status { args } => {
-                git::run(git::GitCommand::Status, &args, None, cli.verbose)?;
+            if let Some(ref dir) = git_dir {
+                global_args.push("--git-dir".to_string());
+                global_args.push(dir.clone());
             }
-            GitCommands::Show { args } => {
-                git::run(git::GitCommand::Show, &args, None, cli.verbose)?;
+            if let Some(ref tree) = work_tree {
+                global_args.push("--work-tree".to_string());
+                global_args.push(tree.clone());
             }
-            GitCommands::Add { args } => {
-                git::run(git::GitCommand::Add, &args, None, cli.verbose)?;
+
+            match command {
+                GitCommands::Diff { args } => {
+                    git::run(
+                        git::GitCommand::Diff,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Log { args } => {
+                    git::run(git::GitCommand::Log, &args, None, cli.verbose, &global_args)?;
+                }
+                GitCommands::Status { args } => {
+                    git::run(
+                        git::GitCommand::Status,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Show { args } => {
+                    git::run(
+                        git::GitCommand::Show,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Add { args } => {
+                    git::run(git::GitCommand::Add, &args, None, cli.verbose, &global_args)?;
+                }
+                GitCommands::Commit { message } => {
+                    git::run(
+                        git::GitCommand::Commit { messages: message },
+                        &[],
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Push { args } => {
+                    git::run(
+                        git::GitCommand::Push,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Pull { args } => {
+                    git::run(
+                        git::GitCommand::Pull,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Branch { args } => {
+                    git::run(
+                        git::GitCommand::Branch,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Fetch { args } => {
+                    git::run(
+                        git::GitCommand::Fetch,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Stash { subcommand, args } => {
+                    git::run(
+                        git::GitCommand::Stash { subcommand },
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Worktree { args } => {
+                    git::run(
+                        git::GitCommand::Worktree,
+                        &args,
+                        None,
+                        cli.verbose,
+                        &global_args,
+                    )?;
+                }
+                GitCommands::Other(args) => {
+                    git::run_passthrough(&args, &global_args, cli.verbose)?;
+                }
             }
-            GitCommands::Commit { message } => {
-                git::run(git::GitCommand::Commit { message }, &[], None, cli.verbose)?;
-            }
-            GitCommands::Push { args } => {
-                git::run(git::GitCommand::Push, &args, None, cli.verbose)?;
-            }
-            GitCommands::Pull { args } => {
-                git::run(git::GitCommand::Pull, &args, None, cli.verbose)?;
-            }
-            GitCommands::Branch { args } => {
-                git::run(git::GitCommand::Branch, &args, None, cli.verbose)?;
-            }
-            GitCommands::Fetch { args } => {
-                git::run(git::GitCommand::Fetch, &args, None, cli.verbose)?;
-            }
-            GitCommands::Stash { subcommand, args } => {
-                git::run(
-                    git::GitCommand::Stash { subcommand },
-                    &args,
-                    None,
-                    cli.verbose,
-                )?;
-            }
-            GitCommands::Worktree { args } => {
-                git::run(git::GitCommand::Worktree, &args, None, cli.verbose)?;
-            }
-            GitCommands::Other(args) => {
-                git::run_passthrough(&args, cli.verbose)?;
-            }
-        },
+        }
 
         Commands::Gh { subcommand, args } => {
             gh_cmd::run(&subcommand, &args, cli.verbose, cli.ultra_compact)?;
+        }
+
+        Commands::Aws { subcommand, args } => {
+            aws_cmd::run(&subcommand, &args, cli.verbose)?;
+        }
+
+        Commands::Psql { args } => {
+            psql_cmd::run(&args, cli.verbose)?;
         }
 
         Commands::Pnpm { command } => match command {
@@ -984,13 +1193,8 @@ fn main() -> Result<()> {
             env_cmd::run(filter.as_deref(), show_all, cli.verbose)?;
         }
 
-        Commands::Find {
-            pattern,
-            path,
-            max,
-            file_type,
-        } => {
-            find_cmd::run(&pattern, &path, max, &file_type, cli.verbose)?;
+        Commands::Find { args } => {
+            find_cmd::run_from_args(&args, cli.verbose)?;
         }
 
         Commands::Diff { file1, file2 } => {
@@ -1084,8 +1288,18 @@ fn main() -> Result<()> {
             max,
             context_only,
             file_type,
+            line_numbers: _, // no-op: line numbers always enabled in grep_cmd::run
+            recursive: _,    // no-op: rg is recursive by default
+            ignore_case,
             extra_args,
         } => {
+            // Prepend -i to extra_args if ignore_case flag was set
+            let mut all_args = if ignore_case {
+                vec!["-i".to_string()]
+            } else {
+                vec![]
+            };
+            all_args.extend(extra_args);
             grep_cmd::run(
                 &pattern,
                 &path,
@@ -1093,7 +1307,7 @@ fn main() -> Result<()> {
                 max,
                 context_only,
                 file_type.as_deref(),
-                &extra_args,
+                &all_args,
                 cli.verbose,
             )?;
         }
@@ -1145,6 +1359,7 @@ fn main() -> Result<()> {
             monthly,
             all,
             format,
+            failures,
         } => {
             gain::run(
                 graph,
@@ -1156,6 +1371,7 @@ fn main() -> Result<()> {
                 monthly,
                 all,
                 &format,
+                failures,
                 cli.verbose,
             )?;
         }
@@ -1422,6 +1638,30 @@ fn main() -> Result<()> {
             hook_audit_cmd::run(since, cli.verbose)?;
         }
 
+        Commands::Run { command } => {
+            let success = cmd::execute(&command, cli.verbose)?;
+            if !success {
+                std::process::exit(1);
+            }
+        }
+
+        Commands::Hook { command } => match command {
+            HookCommands::Check { agent, command } => {
+                let cmd_str = command.join(" ");
+                let result = cmd::check_for_hook(&cmd_str, &agent);
+                let (output, _success, code) = cmd::hook::format_for_claude(result);
+                if code == 0 {
+                    println!("{}", output);
+                } else {
+                    eprintln!("{}", output);
+                    std::process::exit(code);
+                }
+            }
+            HookCommands::Claude => {
+                cmd::claude_hook::run()?;
+            }
+        },
+
         Commands::Proxy { args } => {
             use std::process::Command;
 
@@ -1472,4 +1712,136 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_git_commit_single_message() {
+        let cli = Cli::try_parse_from(["rtk", "git", "commit", "-m", "fix: typo"]).unwrap();
+        match cli.command {
+            Commands::Git {
+                command: GitCommands::Commit { message },
+                ..
+            } => {
+                assert_eq!(message, vec!["fix: typo"]);
+            }
+            _ => panic!("Expected Git Commit command"),
+        }
+    }
+
+    #[test]
+    fn test_git_commit_multiple_messages() {
+        let cli = Cli::try_parse_from([
+            "rtk",
+            "git",
+            "commit",
+            "-m",
+            "feat: add support",
+            "-m",
+            "Body paragraph here.",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Git {
+                command: GitCommands::Commit { message },
+                ..
+            } => {
+                assert_eq!(message, vec!["feat: add support", "Body paragraph here."]);
+            }
+            _ => panic!("Expected Git Commit command"),
+        }
+    }
+
+    #[test]
+    fn test_git_commit_long_flag_multiple() {
+        let cli = Cli::try_parse_from([
+            "rtk",
+            "git",
+            "commit",
+            "--message",
+            "title",
+            "--message",
+            "body",
+            "--message",
+            "footer",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Git {
+                command: GitCommands::Commit { message },
+                ..
+            } => {
+                assert_eq!(message, vec!["title", "body", "footer"]);
+            }
+            _ => panic!("Expected Git Commit command"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_valid_git_status() {
+        let result = Cli::try_parse_from(["rtk", "git", "status"]);
+        assert!(result.is_ok(), "git status should parse successfully");
+    }
+
+    #[test]
+    fn test_try_parse_help_is_display_help() {
+        match Cli::try_parse_from(["rtk", "--help"]) {
+            Err(e) => assert_eq!(e.kind(), ErrorKind::DisplayHelp),
+            Ok(_) => panic!("Expected DisplayHelp error"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_version_is_display_version() {
+        match Cli::try_parse_from(["rtk", "--version"]) {
+            Err(e) => assert_eq!(e.kind(), ErrorKind::DisplayVersion),
+            Ok(_) => panic!("Expected DisplayVersion error"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_unknown_subcommand_is_error() {
+        match Cli::try_parse_from(["rtk", "nonexistent-command"]) {
+            Err(e) => assert!(!matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            )),
+            Ok(_) => panic!("Expected parse error for unknown subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_try_parse_git_with_dash_c_succeeds() {
+        // git -C /path status should parse successfully now that -C is a recognized option
+        let result = Cli::try_parse_from(["rtk", "git", "-C", "/path", "status"]);
+        assert!(result.is_ok(), "git -C should parse successfully");
+    }
+
+    #[test]
+    fn test_gain_failures_flag_parses() {
+        let result = Cli::try_parse_from(["rtk", "gain", "--failures"]);
+        assert!(result.is_ok());
+        if let Ok(cli) = result {
+            match cli.command {
+                Commands::Gain { failures, .. } => assert!(failures),
+                _ => panic!("Expected Gain command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_gain_failures_short_flag_parses() {
+        let result = Cli::try_parse_from(["rtk", "gain", "-F"]);
+        assert!(result.is_ok());
+        if let Ok(cli) = result {
+            match cli.command {
+                Commands::Gain { failures, .. } => assert!(failures),
+                _ => panic!("Expected Gain command"),
+            }
+        }
+    }
 }
